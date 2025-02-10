@@ -1,0 +1,326 @@
+import pandas as pd
+import numpy as np
+import datetime
+import math
+
+
+class DataHandler:
+    """
+    数据读取与预处理类。
+    可以根据需要改写加载方式，例如读取CSV、数据库、API等。
+    返回格式一般是DataFrame。
+    """
+
+    def __init__(self, file_path: str = None):
+        self.file_path = file_path
+        self.data = None
+
+    def load_data(self):
+        """
+        加载数据，并进行必要的预处理（去重、排序等）。
+        假设这里演示读取CSV文件。
+        """
+        if not self.file_path:
+            raise ValueError("请指定CSV文件路径。")
+        self.data = pd.read_csv(self.file_path, parse_dates=['date'])
+        self.data.sort_values(by='date', inplace=True)
+        self.data.reset_index(drop=True, inplace=True)
+
+    def get_data(self):
+        """
+        对外提供数据访问接口。
+        返回按照日期升序排列的DataFrame。
+        """
+        if self.data is None:
+            raise ValueError("请先调用load_data方法加载数据。")
+        return self.data
+
+
+class Strategy:
+    """
+    策略基类，定义了generate_signals方法，需要在子类中实现具体逻辑。
+    """
+
+    def generate_signals(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        data: DataFrame 格式的行情数据
+        返回值: 返回包含交易信号的DataFrame，必须至少包含列['date', 'signal']。
+               signal取值可以是1(买入), -1(卖出)或0(持仓/空仓)。
+        """
+        raise NotImplementedError("请在子类中实现该方法。")
+
+
+class MovingAverageStrategy(Strategy):
+    """
+    示例策略：双均线策略
+    - 短期均线 > 长期均线 => 买入/持仓
+    - 短期均线 < 长期均线 => 空仓/卖出
+    """
+
+    def __init__(self, short_window: int = 10, long_window: int = 30):
+        self.short_window = short_window
+        self.long_window = long_window
+
+    def generate_signals(self, data: pd.DataFrame) -> pd.DataFrame:
+        df = data.copy()
+        # 计算短期/长期均线
+        df['ma_short'] = df['close'].rolling(window=self.short_window).mean()
+        df['ma_long'] = df['close'].rolling(window=self.long_window).mean()
+
+        # 当短期均线大于长期均线，则 signal = 1，否则 signal = 0（本例仅演示多头策略，没有做空）
+        df['signal'] = np.where(df['ma_short'] > df['ma_long'], 1, 0)
+
+        # 因为需要在两均线都有效的时候才有信号，因此前面部分NaN要填充或者去掉
+        df.dropna(inplace=True)
+        # 提取所需列
+        signals = df[['date', 'signal']].copy()
+
+        return signals
+
+
+class BrokerSimulator:
+    """
+    模拟交易撮合的核心模块。根据策略给出的信号来生成成交结果。
+    可以自定义更复杂的成交机制，如滑点、交易费用、限价单、止损等。
+    """
+
+    def __init__(self, slippage: float = 0.0, commission_rate: float = 0.0):
+        self.slippage = slippage
+        self.commission_rate = commission_rate
+
+    def execute_order(self, date: pd.Timestamp, signal: int, price: float, shares: int = 1):
+        """
+        根据signal(1为买入, -1为卖出, 0为不操作)进行交易撮合，返回成交记录。
+        """
+        if signal == 0:
+            return None  # 没有订单
+
+        # 考虑滑点
+        fill_price = price + self.slippage if signal == 1 else price - self.slippage
+        # 计算手续费
+        commission = fill_price * shares * self.commission_rate
+
+        # 构造成交记录，可以根据需要添加更多字段
+        trade_record = {
+            "date": date,
+            "signal": signal,
+            "fill_price": fill_price,
+            "shares": shares,
+            "commission": commission
+        }
+        return trade_record
+
+
+class Portfolio:
+    """
+    投资组合类，记录头寸、持仓价值、现金、交易历史等信息。
+    """
+
+    def __init__(self, initial_capital: float = 100000.0):
+        self.initial_capital = initial_capital
+        self.current_cash = initial_capital
+        self.shares = 0  # 当前持有的股票数量
+        self.trade_history = []
+        self.portfolio_value_series = []
+
+    def update_after_trade(self, trade_record: dict):
+        """
+        接收一条交易记录，更新持仓与资金信息。
+        """
+        if not trade_record:
+            return
+        # 根据交易方向和成交数量更新持仓数量
+        if trade_record['signal'] == 1:
+            # 买入
+            cost = trade_record['fill_price'] * trade_record['shares'] + trade_record['commission']
+            self.current_cash -= cost
+            self.shares += trade_record['shares']
+        elif trade_record['signal'] == -1:
+            # 卖出
+            revenue = trade_record['fill_price'] * trade_record['shares'] - trade_record['commission']
+            self.current_cash += revenue
+            self.shares -= trade_record['shares']
+
+        # 记录交易
+        self.trade_history.append(trade_record)
+
+    def update_portfolio_value(self, date, price):
+        """
+        在每日收盘后更新组合价值(持仓市值 + 现金)并保存。
+        """
+        market_value = self.shares * price
+        total_value = self.current_cash + market_value
+        self.portfolio_value_series.append({
+            "date": date,
+            "total_value": total_value,
+            "cash": self.current_cash,
+            "shares": self.shares
+        })
+
+    def get_value_series_df(self) -> pd.DataFrame:
+        """
+        将每日的组合价值序列转换为DataFrame返回。
+        """
+        return pd.DataFrame(self.portfolio_value_series)
+
+
+class Performance:
+    """
+    绩效评价模块，计算常见的回测指标：
+    - 年化收益率
+    - 最大回撤
+    - 夏普比率等
+    """
+
+    @staticmethod
+    def annual_return(value_series: pd.DataFrame) -> float:
+        """
+        计算年化收益率：假设数据是按日频率来统计。
+        如果频率不同，需要根据实际情况调整。
+        """
+        if len(value_series) < 2:
+            return 0.0
+
+        start_val = value_series['total_value'].iloc[0]
+        end_val = value_series['total_value'].iloc[-1]
+        # 回测天数
+        days = (value_series['date'].iloc[-1] - value_series['date'].iloc[0]).days
+        if days == 0:
+            return 0.0
+
+        total_return = (end_val - start_val) / start_val
+        annual_return = (1 + total_return) ** (365.0 / days) - 1
+        return annual_return
+
+    @staticmethod
+    def max_drawdown(value_series: pd.DataFrame) -> float:
+        """
+        计算最大回撤
+        """
+        cumulative = value_series['total_value'].cummax()
+        drawdown = (value_series['total_value'] - cumulative) / cumulative
+        max_dd = drawdown.min()
+        return max_dd
+
+    @staticmethod
+    def sharpe_ratio(value_series: pd.DataFrame, rf: float = 0.0) -> float:
+        """
+        计算夏普比率:
+        - rf 为无风险利率，默认为0
+        - 使用简单的日度收益率计算，也可使用对数收益。
+        """
+        value_series['daily_return'] = value_series['total_value'].pct_change().fillna(0.0)
+        excess_return = value_series['daily_return'] - rf / 252  # 年化转为日化
+        if excess_return.std() == 0:
+            return 0.0
+        sr = np.sqrt(252) * excess_return.mean() / excess_return.std()
+        return sr
+
+
+class BacktestingEngine:
+    """
+    回测引擎，整合DataHandler、Strategy、BrokerSimulator、Portfolio、Performance等模块。
+    """
+
+    def __init__(self,
+                 data_handler: DataHandler,
+                 strategy: Strategy,
+                 broker: BrokerSimulator,
+                 portfolio: Portfolio):
+        self.data_handler = data_handler
+        self.strategy = strategy
+        self.broker = broker
+        self.portfolio = portfolio
+
+    def run_backtest(self):
+        """
+        运行回测：
+        1. 从DataHandler获取数据
+        2. 使用Strategy生成交易信号
+        3. 逐日(或逐笔)进行模拟交易并更新Portfolio
+        4. 在每日结束后记录组合价值
+        """
+        data = self.data_handler.get_data()  # 获取行情数据
+        signals = self.strategy.generate_signals(data)  # 生成交易信号
+
+        # 将交易信号与原数据合并，确保每天都有signal信息
+        merged_data = pd.merge(data, signals, on='date', how='left')
+        merged_data['signal'].fillna(0, inplace=True)
+
+        for i in range(len(merged_data)):
+            row = merged_data.iloc[i]
+            current_date = row['date']
+            current_price = row['close']
+            current_signal = row['signal']
+
+            # 仅在signal变化时才执行操作，或也可每日都执行(可根据需求变更)
+            if i > 0:
+                previous_signal = merged_data.iloc[i - 1]['signal']
+            else:
+                previous_signal = 0
+
+            # 当signal从0 -> 1时买入, 1 -> 0时卖出（该逻辑可自行扩展）
+            if (previous_signal == 0 and current_signal == 1):
+                # 买入
+                trade_record = self.broker.execute_order(current_date, 1, current_price, shares=100)
+                self.portfolio.update_after_trade(trade_record)
+            elif (previous_signal == 1 and current_signal == 0):
+                # 卖出
+                trade_record = self.broker.execute_order(current_date, -1, current_price, shares=100)
+                self.portfolio.update_after_trade(trade_record)
+
+            # 每日收盘后记录组合价值
+            self.portfolio.update_portfolio_value(current_date, current_price)
+
+    def output_performance(self):
+        """
+        计算并输出回测绩效指标。
+        """
+        value_series = self.portfolio.get_value_series_df()
+        ann_ret = Performance.annual_return(value_series)
+        max_dd = Performance.max_drawdown(value_series)
+        sharpe = Performance.sharpe_ratio(value_series, rf=0.02)  # 假设年化无风险收益2%
+
+        print("============== 回测绩效 ==============")
+        print(f"初始资金: {self.portfolio.initial_capital:.2f}")
+        print(f"结束资金: {value_series['total_value'].iloc[-1]:.2f}")
+        print(f"年化收益率: {ann_ret * 100:.2f}%")
+        print(f"最大回撤: {max_dd * 100:.2f}%")
+        print(f"夏普比率: {sharpe:.2f}")
+        print("=====================================")
+
+        return {
+            "annual_return": ann_ret,
+            "max_drawdown": max_dd,
+            "sharpe_ratio": sharpe
+        }
+
+
+if __name__ == "__main__":
+    """
+    演示如何使用整个回测框架。
+    注意：需要提供真实数据文件的路径。
+    假设行情数据CSV中包含 'date', 'open', 'high', 'low', 'close', 'volume' 等列。
+    """
+    # 1. 准备数据
+    file_path = "your_data.csv"  # 请替换为真实CSV文件路径
+    data_handler = DataHandler(file_path=file_path)
+    data_handler.load_data()
+
+    # 2. 配置策略
+    ma_strategy = MovingAverageStrategy(short_window=10, long_window=30)
+
+    # 3. 配置模拟交易撮合
+    broker = BrokerSimulator(slippage=0.01, commission_rate=0.001)
+
+    # 4. 配置投资组合
+    portfolio = Portfolio(initial_capital=100000.0)
+
+    # 5. 初始化并运行回测引擎
+    engine = BacktestingEngine(data_handler, ma_strategy, broker, portfolio)
+    engine.run_backtest()
+    results = engine.output_performance()
+
+    # 6. 如果需要，可以进一步获取每日组合价值数据，进行可视化分析
+    value_series_df = portfolio.get_value_series_df()
+    print(value_series_df.tail())
